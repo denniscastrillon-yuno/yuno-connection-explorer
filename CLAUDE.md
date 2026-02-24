@@ -2,20 +2,37 @@
 
 ## Project Overview
 
-**Yuno Connection Explorer** is a Streamlit dashboard that dynamically discovers and displays all payment provider connections configured in a Yuno organization. It uses Yuno's internal staging APIs to list accounts, their connections, and full connection details including credentials and parameters.
+**Yuno Connection Explorer** is a multipage Streamlit app with two tools:
 
-This tool is designed for QA engineers and integration developers who need to quickly inspect provider configurations without navigating the Yuno Dashboard.
+1. **Connection Explorer** — dynamically discovers and displays all payment provider connections in a Yuno organization via internal staging APIs.
+2. **Replicate Connections** — copies connections and routing rules from a source account to a target organization, entirely via direct API calls (no browser automation).
+
+Designed for QA engineers and integration developers who need to inspect provider configurations and replicate them across organizations.
 
 ## Architecture
 
 ```
-Streamlit App (app.py)
-  ├── config.py          # Environment variables (org code, API base)
-  ├── yuno_client.py     # HTTP client for Yuno internal APIs
-  └── .env               # Runtime configuration
+Streamlit Multipage App
+├── app.py                           # Landing page with links to both tools
+├── helpers.py                       # Shared helpers (fetchers, rendering, extraction)
+├── config.py                        # Environment variables (org code, API base)
+├── yuno_client.py                   # HTTP client for Yuno internal APIs
+├── pages/
+│   ├── 1_Connection_Explorer.py     # Browse connections (original app functionality)
+│   └── 2_Replicate_Connections.py   # Replicate connections & routing via API
+├── replicator/
+│   ├── __init__.py
+│   ├── models.py                    # Dataclasses: ConnectionSpec, RoutingSpec, routing models
+│   ├── param_mapper.py              # Fuzzy matching of API params (for preview only)
+│   ├── account_manager.py           # Account creation/lookup via organization-user-ms API
+│   ├── connection_creator.py        # Connection creation via organization-ms API
+│   ├── routing_creator.py           # Routing rules via routing-ms API
+│   ├── routing_fetcher.py           # HTTP client for routing-ms API (read-only)
+│   └── orchestrator.py              # Workflow coordinator with progress callbacks
+└── .env                             # Runtime configuration (gitignored)
 ```
 
-### Data Flow
+### Data Flow — Connection Explorer
 
 ```
 App startup
@@ -45,6 +62,49 @@ get_connection(account_id, connection_id)
   → Returns: {connection_name, provider_id, country, params: [{param_id, value, country, type}], ...}
 ```
 
+### Data Flow — Replicate Connections
+
+```
+User selects source account + connections (via API)
+  │
+  ▼
+Build ConnectionSpec from API data
+  │
+  ▼
+Smart routing analysis (routing_fetcher.py):
+  For each PM the connections support:
+    GET /routing-ms/v1/by-payment-method/{pm} → find published version
+    GET /routing-ms/v1/{published_code} → full routing details + raw condition_sets
+  Filter: only PMs with published routing referencing selected connections
+  │
+  ▼
+Show plan: connections + filtered routing rules with source details
+  │
+  ▼
+Account setup via API:
+  1. GET /organization-user-ms/v1/accounts/by-organization → find existing or:
+  2. GET /organization-user-ms/v1/organizations/{org}/users → get user_code
+  3. POST /organization-user-ms/v1/accounts → create account → get code_live
+  │
+  ▼
+Connection creation via API:
+  For each connection:
+    1. GET /organization-ms/v1/connections/ → idempotency check (by name)
+    2. POST /organization-ms/v1/organizations/{org}/integrations → create connection
+  │
+  ▼
+Routing via API:
+  For each routing rule:
+    1. POST /v1/connections/providers → find target integration codes
+    2. Build condition sets by remapping source → target integration codes
+    3. POST /v1/ → create draft
+    4. PUT /v1/{code} → update with condition sets
+    5. POST /v1/{code}/publish → publish
+  │
+  ▼
+Results with per-step success/failure
+```
+
 ## Essential Commands
 
 ```bash
@@ -64,10 +124,20 @@ streamlit run app.py --server.headless true
 
 | File | Purpose |
 |------|---------|
-| `app.py` | Streamlit UI: sidebar with dynamic account selector, search filter, data tables, expandable detail cards with credentials. Handles single-account and all-accounts (concurrent) flows. |
-| `yuno_client.py` | HTTP client wrapping 3 Yuno internal API endpoints. Uses `_error` sentinel pattern for error propagation. |
-| `config.py` | Loads `.env` via python-dotenv. Exports `INTERNAL_API_BASE` and `ORGANIZATION_CODE`. |
-| `.env` | Runtime config. Only `ORGANIZATION_CODE` needed. Not committed to git. |
+| `app.py` | Landing page with links to Connection Explorer and Replicate Connections. |
+| `helpers.py` | Shared helpers: `conn_id()`, `conn_provider()`, `render_connection_detail()`, cached fetchers (`fetch_accounts`, `fetch_connections`, `fetch_connection_detail`). |
+| `yuno_client.py` | HTTP client wrapping 3 Yuno internal API endpoints. Uses `_error` sentinel pattern. |
+| `config.py` | Loads `.env` via python-dotenv. Exports `INTERNAL_API_BASE`, `ORGANIZATION_CODE`, `DASHBOARD_URL`. |
+| `pages/1_Connection_Explorer.py` | Browse connections: sidebar selector, data tables, expandable detail cards with credentials. Single-account and all-accounts (concurrent) flows. |
+| `pages/2_Replicate_Connections.py` | Replicate connections UI: source selection with checkboxes, plan review, execution with progress bar and results. |
+| `replicator/models.py` | Dataclasses: `ConnectionParam`, `ConnectionSpec`, `RoutingSpec`, `StepResult`, `ReplicationResult`, routing models (`RoutingCondition`, `RouteConnection`, `ConditionSetData`, `PublishedRouting`). |
+| `replicator/param_mapper.py` | Fuzzy matching: normalizes `param_id` and field labels, matches by exact/substring/positional/unmatched layers. |
+| `replicator/account_manager.py` | Account creation/lookup via organization-user-ms API. `ensure_account(name)` returns `(name, code_live)`. |
+| `replicator/connection_creator.py` | Connection creation via organization-ms integrations API. `create_connection_api(code, spec)` returns `StepResult`. |
+| `replicator/routing_creator.py` | Creates and publishes routing rules via direct routing-ms API calls. Maps source condition sets to target integration codes. |
+| `replicator/routing_fetcher.py` | HTTP client for routing-ms API. Fetches published routing details per PM. Uses GET /by-payment-method/{pm} endpoint. |
+| `replicator/orchestrator.py` | `Replicator` class: coordinates account setup → connections → routing. All via API, no browser. |
+| `.env` | Runtime config. Not committed to git. |
 
 ## API Endpoints Used
 
@@ -76,8 +146,17 @@ All endpoints hit `https://internal-staging.y.uno` (no auth tokens required):
 | Method | Endpoint | Key Header | Purpose |
 |--------|----------|------------|---------|
 | GET | `/organization-user-ms/v1/accounts/by-organization` | `x-organization-code` | List all accounts in the org |
+| GET | `/organization-user-ms/v1/organizations/{org}/users` | `x-organization-code` | Get user codes for account creation |
+| POST | `/organization-user-ms/v1/accounts` | `x-organization-code`, `x-user-code` | Create a new account |
 | GET | `/organization-ms/v1/connections/` | `x-account-code` | List connections for an account |
 | GET | `/organization-ms/v1/connections/{code}` | `x-account-code` | Get connection detail with credentials |
+| POST | `/organization-ms/v1/organizations/{org}/integrations` | `x-account-code`, `x-organization-code` | Create connection with params |
+| GET | `/routing-ms/v1/by-payment-method/{pm}` | `x-account-code`, `x-user-code` | Get versions for a PM (find published) |
+| GET | `/routing-ms/v1/{version_code}` | `x-account-code`, `x-user-code` | Get full routing details for a version |
+| POST | `/routing-ms/v1/` | `x-account-code`, `x-user-code` | Create draft routing version |
+| PUT | `/routing-ms/v1/{version_code}` | `x-account-code`, `x-user-code` | Update version with condition sets |
+| POST | `/routing-ms/v1/{version_code}/publish` | `x-account-code`, `x-user-code` | Publish a routing version |
+| POST | `/routing-ms/v1/connections/providers` | `x-account-code`, `x-user-code` | Find provider integration codes (body: paymentMethod, country) |
 
 ## API Response Shapes
 
@@ -131,21 +210,29 @@ Key: credentials live inside `params` array as `{param_id, value}` pairs.
 ## Key Design Decisions
 
 - **Dynamic account discovery**: No hardcoded provider-to-account mapping. Accounts are fetched from the API at startup and cached for 5 minutes.
-- **`_error` sentinel pattern**: API errors are returned as `{"_error": "message"}` dicts mixed into result lists, allowing partial success (some accounts fail, others succeed).
-- **`_conn_id()` / `_conn_provider()` helpers**: Defensive extraction that handles multiple possible field names across the list and detail endpoints.
-- **ThreadPoolExecutor(20 workers)**: "All Accounts" mode fetches connections concurrently with a progress bar.
-- **Streamlit caching**: `@st.cache_data(ttl=300)` on all API calls to avoid redundant requests.
+- **`_error` sentinel pattern**: API errors are returned as `{"_error": "message"}` dicts mixed into result lists, allowing partial success.
+- **Pure API replication**: All replication (account creation, connections, routing) uses direct HTTP calls to internal staging APIs. No browser automation, no Playwright, no Auth0 login needed.
+- **Idempotent operations**: Account and connection creation check for existing resources by name before creating new ones.
+- **Modular replicator**: Account/connection/routing in separate modules for testability and iterative development.
+- **Individual failure tolerance**: Connection/routing failures don't stop the process; only account setup failure is fatal.
+- **ThreadPoolExecutor(20 workers)**: "All Accounts" mode fetches connections concurrently.
+- **Streamlit caching**: `@st.cache_data(ttl=300)` on all API calls.
+- **Smart routing filtering**: Routing specs are built by querying routing-ms API at plan time (not at execution time). Only PMs with PUBLISHED routing that reference at least one of the selected connections get routing created. Raw condition_sets JSON is stored on each RoutingSpec for later API-based creation.
+- **routing-ms API flow (read)**: GET /by-payment-method/{pm} -> find published version -> GET /{code} for full details. The `x-user-code: 00000000-...` header is a dummy value that works for all queries.
+- **routing-ms API flow (write)**: POST /v1/ creates draft -> PUT /v1/{code} updates with remapped condition_sets -> POST /v1/{code}/publish. Source integration codes are mapped to target codes via POST /v1/connections/providers.
 
 ## Development Notes
 
 - The app connects to **staging** internal APIs only. No production endpoints are used.
 - The `ORGANIZATION_CODE` default (`6fd95f92-...`) is the Yuno QA/Integrations org in staging.
 - Network access to `internal-staging.y.uno` is required (VPN or internal network).
-- Python 3.10+ required (uses `list[dict]` type hints).
+- Python 3.10+ required (uses `list[dict]` type hints and `str | None`).
 
 ## When Modifying This Project
 
-- If the API response shape changes, update `_conn_id()`, `_conn_provider()`, and `_render_connection_detail()` in `app.py`.
+- If the API response shape changes, update `conn_id()`, `conn_provider()`, and `render_connection_detail()` in `helpers.py`.
 - If new API endpoints are needed, add them to `yuno_client.py` following the existing pattern.
 - Keep `config.py` minimal — only environment variables, no business logic.
 - The `.env` file is gitignored. Use `.env.example` as template.
+- `routing_creator.py` is API-based. If routing-ms endpoints change, update the API calls there.
+- `param_mapper.py` handles fuzzy matching of API param names to form field labels. If new matching strategies are needed, add them as additional layers.
