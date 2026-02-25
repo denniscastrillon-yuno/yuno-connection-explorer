@@ -152,6 +152,60 @@ def _truncate_value(value: str, max_len: int = 12) -> str:
     return value[:max_len] + "..."
 
 
+def resolve_routing_dependencies(
+    connection_specs: list[ConnectionSpec],
+    routing_specs: list[RoutingSpec],
+    source_connections: list[dict],
+    account_id: str,
+) -> list[ConnectionSpec]:
+    """Auto-detect and add missing connections required by routing condition sets.
+
+    Scans all routing condition sets for integration codes not covered by the
+    user-selected connections. For each missing code, finds the source connection,
+    fetches its detail, and builds a ConnectionSpec with ``is_dependency=True``.
+
+    Returns the list of newly added dependency ConnectionSpecs.
+    """
+    # Collect integration codes already selected
+    selected_codes = {s.integration_code for s in connection_specs if s.integration_code}
+
+    # Collect ALL integration codes referenced in routing condition sets
+    needed_codes: set[str] = set()
+    for rs in routing_specs:
+        if not rs.source_condition_sets_raw:
+            continue
+        for cs in rs.source_condition_sets_raw:
+            for route in cs.get("routes", []):
+                if route.get("type") == "PROVIDER":
+                    ic = route.get("data", {}).get("integration_code", "")
+                    if ic:
+                        needed_codes.add(ic)
+
+    missing_codes = needed_codes - selected_codes
+    if not missing_codes:
+        return []
+
+    # Build a lookup: integration_code (= code field) -> connection list item
+    code_to_conn: dict[str, dict] = {}
+    for conn in source_connections:
+        cid = conn_id(conn)
+        if cid in missing_codes:
+            code_to_conn[cid] = conn
+
+    # Fetch details and build specs for each missing connection
+    deps: list[ConnectionSpec] = []
+    for ic in sorted(missing_codes):
+        if ic not in code_to_conn:
+            continue
+        detail = fetch_connection_detail(account_id, ic)
+        if isinstance(detail, dict) and "_error" not in detail:
+            spec = _build_connection_spec(detail)
+            spec.is_dependency = True
+            deps.append(spec)
+
+    return deps
+
+
 # -- Main: Step 1 -- Source Selection ------------------------------------------
 st.header("Replicate Connections")
 st.markdown("Copy connections and routing rules from a source account to your target organization via API.")
@@ -188,11 +242,16 @@ if not connections:
     st.stop()
 
 # Build table with checkboxes
+select_all = st.checkbox(
+    f"Select all ({len(connections)} connections)",
+    value=False,
+)
+
 conn_rows = []
 for conn in connections:
     cid = conn_id(conn)
     conn_rows.append({
-        "Select": False,
+        "Select": select_all,
         "Name": conn.get("name", ""),
         "Provider": conn_provider(conn),
         "Country": conn.get("country", ""),
@@ -248,25 +307,45 @@ if not connection_specs:
 
 # Build routing specs (smart: query routing-ms for actual published routing)
 routing_details: dict[str, PublishedRouting] = {}
+dependency_specs: list[ConnectionSpec] = []
 if include_routing:
     all_pms_count = sum(len(s.payment_methods) for s in connection_specs)
     with st.spinner(f"Querying routing status for {all_pms_count} payment methods..."):
         routing_specs, routing_details = _build_smart_routing_specs(
             connection_specs, account_id,
         )
+    # Auto-detect missing connections required by routing condition sets
+    if routing_specs:
+        with st.spinner("Resolving routing dependencies..."):
+            dependency_specs = resolve_routing_dependencies(
+                connection_specs, routing_specs, connections, account_id,
+            )
+        if dependency_specs:
+            connection_specs.extend(dependency_specs)
+            # Re-build routing specs now that we have the full set of connections
+            with st.spinner("Re-analyzing routing with dependency connections..."):
+                routing_specs, routing_details = _build_smart_routing_specs(
+                    connection_specs, account_id,
+                )
 else:
     routing_specs = []
 
 # Summary
-col1, col2, col3 = st.columns(3)
-col1.metric("Connections to create", len(connection_specs))
-col2.metric("Routing rules to create", len(routing_specs))
+selected_count = sum(1 for s in connection_specs if not s.is_dependency)
+dep_count = sum(1 for s in connection_specs if s.is_dependency)
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Selected connections", selected_count)
+col2.metric("Auto-added dependencies", dep_count)
+col3.metric("Routing rules to create", len(routing_specs))
 if include_routing:
     all_pms_count = len({pm for s in connection_specs for pm in s.payment_methods})
-    col3.metric("PMs with published routing", f"{len(routing_specs)}/{all_pms_count}")
+    col4.metric("PMs with published routing", f"{len(routing_specs)}/{all_pms_count}")
 
-# Detail expanders
-for spec in connection_specs:
+# Detail expanders — separate selected from dependencies
+selected_specs = [s for s in connection_specs if not s.is_dependency]
+dep_specs_display = [s for s in connection_specs if s.is_dependency]
+
+for spec in selected_specs:
     with st.expander(f"{spec.connection_name} ({spec.provider_id} / {spec.country})"):
         st.markdown(f"**Provider:** {spec.provider_id}")
         st.markdown(f"**Country:** {spec.country}")
@@ -275,6 +354,18 @@ for spec in connection_specs:
         for p in spec.params:
             st.code(f"[{p.country}] {p.param_id} = {_truncate_value(p.value)}", language="text")
 
+if dep_specs_display:
+    st.markdown("#### Auto-added dependencies")
+    st.caption("These connections are referenced by routing condition sets and will be created automatically.")
+    for spec in dep_specs_display:
+        with st.expander(f"[DEP] {spec.connection_name} ({spec.provider_id} / {spec.country})"):
+            st.markdown(f"**Provider:** {spec.provider_id}")
+            st.markdown(f"**Country:** {spec.country}")
+            st.markdown(f"**Payment Methods:** {', '.join(spec.payment_methods) if spec.payment_methods else 'None'}")
+            st.markdown(f"**Parameters ({len(spec.params)}):**")
+            for p in spec.params:
+                st.code(f"[{p.country}] {p.param_id} = {_truncate_value(p.value)}", language="text")
+
 # Show unmatched warnings
 if unmatched_mappings:
     st.warning("Some parameters could not be auto-matched to dashboard form fields. They will be filled by position during creation.")
@@ -282,6 +373,11 @@ if unmatched_mappings:
         st.caption(f"{conn_name}: {', '.join(m.param_id for m in unmatched)}")
 
 if include_routing and routing_specs:
+    # Build lookup sets for marker display
+    selected_codes = {s.integration_code for s in connection_specs if s.integration_code and not s.is_dependency}
+    dep_codes = {s.integration_code for s in connection_specs if s.integration_code and s.is_dependency}
+    all_codes = selected_codes | dep_codes
+
     with st.expander(f"Routing rules to create ({len(routing_specs)} PMs)", expanded=True):
         for rs in routing_specs:
             routing = routing_details.get(rs.payment_method)
@@ -291,21 +387,22 @@ if include_routing and routing_specs:
                     f"**{rs.payment_method}** -> {rs.connection_name} "
                     f"| Source: {n_sets} condition set(s) | Version: _{routing.version_name}_"
                 )
-                # Show condition sets details
+                # Show condition sets details with markers
                 for cs in routing.condition_sets:
-                    conn_names = ", ".join(
-                        f"{r.provider_name} ({r.integration_code[:8]}...)"
-                        for r in cs.routes
-                    )
-                    is_ours = any(
-                        r.integration_code in {
-                            s.integration_code for s in connection_specs
-                        }
-                        for r in cs.routes
-                    )
-                    marker = " **[OURS]**" if is_ours else ""
+                    route_parts: list[str] = []
+                    for r in cs.routes:
+                        code_short = r.integration_code[:8] + "..." if r.integration_code else "?"
+                        if r.integration_code in selected_codes:
+                            route_parts.append(f"**{r.provider_name}** ({code_short}) [SELECTED]")
+                        elif r.integration_code in dep_codes:
+                            route_parts.append(f"**{r.provider_name}** ({code_short}) [DEP]")
+                        elif r.integration_code in all_codes:
+                            route_parts.append(f"{r.provider_name} ({code_short})")
+                        else:
+                            route_parts.append(f"~~{r.provider_name}~~ ({code_short}) [MISSING]")
+                    conn_names = ", ".join(route_parts)
                     st.caption(
-                        f"  {cs.sort_number}. {cs.display_label} -> {conn_names}{marker}"
+                        f"  {cs.sort_number}. {cs.display_label} -> {conn_names}"
                     )
             else:
                 st.markdown(f"- **{rs.payment_method}** -> {rs.connection_name}")

@@ -73,10 +73,11 @@ class Replicator:
 
         # Save source integration codes BEFORE creating connections
         # (create_connection_api overwrites spec.integration_code with the target code)
-        source_integration_codes: dict[str, str] = {}  # source_code -> provider_id
+        # Use connection_name as stable key (not provider_id, which can repeat)
+        source_code_to_name: dict[str, str] = {}  # source_integration_code -> connection_name
         for spec in self.connections:
             if spec.integration_code:
-                source_integration_codes[spec.integration_code] = spec.provider_id
+                source_code_to_name[spec.integration_code] = spec.connection_name
 
         # Step 2: Create connections (API)
         for i, conn_spec in enumerate(self.connections):
@@ -92,14 +93,14 @@ class Replicator:
 
         # Build source_integration_code -> target_integration_code map
         # After creation, spec.integration_code holds the TARGET code
-        provider_to_target: dict[str, str] = {}
+        name_to_target: dict[str, str] = {}
         for spec in self.connections:
             if spec.integration_code:
-                provider_to_target[spec.provider_id] = spec.integration_code
+                name_to_target[spec.connection_name] = spec.integration_code
 
         integration_code_map: dict[str, str] = {}
-        for source_code, provider_id in source_integration_codes.items():
-            target_code = provider_to_target.get(provider_id)
+        for source_code, conn_name in source_code_to_name.items():
+            target_code = name_to_target.get(conn_name)
             if target_code:
                 integration_code_map[source_code] = target_code
 

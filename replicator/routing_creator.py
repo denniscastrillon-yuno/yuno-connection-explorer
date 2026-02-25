@@ -146,12 +146,12 @@ def update_routing_version(
             timeout=15,
         )
         if resp.status_code != 200:
-            log.warning("update_routing_version failed: %s %s", resp.status_code, resp.text[:300])
-            return False
+            error_detail = resp.text[:500]
+            log.warning("update_routing_version failed: %s %s", resp.status_code, error_detail)
+            raise RuntimeError(f"PUT routing {version_code} returned {resp.status_code}: {error_detail}")
         return True
-    except Exception as e:
-        log.warning("update_routing_version exception: %s", e)
-        return False
+    except requests.RequestException as e:
+        raise RuntimeError(f"PUT routing {version_code} network error: {e}") from e
 
 
 def publish_routing_version(
@@ -178,6 +178,37 @@ def publish_routing_version(
 # ---------------------------------------------------------------------------
 # Condition set building
 # ---------------------------------------------------------------------------
+
+def _clean_condition(cond: dict) -> dict:
+    """Strip a source condition down to fields the PUT API accepts."""
+    cleaned: dict = {
+        "condition_type": cond.get("condition_type", ""),
+        "values": cond.get("values", []),
+        "conditional": cond.get("conditional", "EQUAL"),
+    }
+    if cond.get("metadata_key"):
+        cleaned["metadata_key"] = cond["metadata_key"]
+    if cond.get("additional_field_name"):
+        cleaned["additional_field_name"] = cond["additional_field_name"]
+    return cleaned
+
+
+def _clean_route_data(data: dict, route_type: str) -> dict:
+    """Strip route data to fields the PUT API accepts."""
+    if route_type == "PROVIDER":
+        cleaned = {
+            "integration_code": data.get("integration_code", ""),
+            "provider_id": data.get("provider_id", ""),
+        }
+        # Preserve optional provider settings
+        for key in ("network_token_on", "time_out", "smart_routing",
+                     "three_d_secure_exemptions", "percentage"):
+            if key in data:
+                cleaned[key] = data[key]
+        return cleaned
+    # ENDING, AUTHENTICATION, FRAUD, etc. — pass through as-is
+    return data
+
 
 def build_target_condition_sets(
     source_condition_sets_raw: list[dict],
@@ -206,25 +237,25 @@ def build_target_condition_sets(
                 src_code = route.get("data", {}).get("integration_code", "")
                 target_code = integration_code_map.get(src_code)
                 if target_code is None:
-                    # Source integration not available in target — skip route
                     continue
+                data = dict(route.get("data", {}))
+                data["integration_code"] = target_code
                 mapped_route = {
                     "type": "PROVIDER",
-                    "data": {
-                        **route.get("data", {}),
-                        "integration_code": target_code,
-                    },
+                    "data": _clean_route_data(data, "PROVIDER"),
                 }
-                # Copy outputs if present
                 if "outputs" in route:
                     mapped_route["outputs"] = route["outputs"]
                 mapped_routes.append(mapped_route)
 
             elif route_type == "ENDING":
-                mapped_routes.append({
+                mapped_route = {
                     "type": "ENDING",
                     "data": route.get("data", {}),
-                })
+                }
+                if "outputs" in route:
+                    mapped_route["outputs"] = route["outputs"]
+                mapped_routes.append(mapped_route)
 
             else:
                 # AUTHENTICATION, FRAUD, etc. — keep as-is
@@ -234,21 +265,22 @@ def build_target_condition_sets(
                     **({"outputs": route["outputs"]} if "outputs" in route else {}),
                 })
 
-        # Skip condition set if no PROVIDER routes remain
-        has_provider = any(r.get("type") == "PROVIDER" for r in mapped_routes)
-        if not has_provider:
+        # Skip condition set if no usable routes remain
+        has_usable_route = any(
+            r.get("type") in ("PROVIDER", "ENDING") for r in mapped_routes
+        )
+        if not has_usable_route:
             continue
 
         # Re-index routes sequentially and fix next_route_indexes
         _reindex_routes(mapped_routes)
 
-        # Build condition set preserving required fields from source
+        # Build condition set with cleaned conditions
         target_cs: dict = {
-            "conditions": cs.get("conditions", []),
+            "conditions": [_clean_condition(c) for c in cs.get("conditions", [])],
             "routes": mapped_routes,
             "category": cs.get("category", "PAYMENT"),
         }
-        # Preserve optional fields the API may need
         if "start" in cs:
             target_cs["start"] = cs["start"]
         if "sort_number" in cs:
@@ -265,7 +297,6 @@ def build_target_condition_sets(
         for cs in result
     )
     if not has_catch_all and result:
-        # Convert the last condition set to catch-all
         result[-1]["conditions"] = [{"condition_type": "EMPTY_CONDITION", "values": [], "conditional": "EQUAL"}]
         result[-1].setdefault("category", "PAYMENT")
 
@@ -274,22 +305,25 @@ def build_target_condition_sets(
 
 def _reindex_routes(routes: list[dict]) -> None:
     """Re-index routes 0..N-1 and fix all next_route_indexes references."""
-    # Build old-index → new-index mapping
     old_to_new: dict[int, int] = {}
     for new_idx, route in enumerate(routes):
         old_idx = route.pop("index", new_idx)
         old_to_new[old_idx] = new_idx
         route["index"] = new_idx
 
-    # Fix next_route_indexes in outputs (routing-ms uses snake_case)
     for route in routes:
         for output in route.get("outputs", []):
-            # Handle both snake_case (from real API) and camelCase (just in case)
             old_refs = output.get("next_route_indexes") or output.get("nextRouteIndexes") or []
-            new_refs = [old_to_new[ref] for ref in old_refs if ref in old_to_new]
-            # Write back in snake_case (API format)
+            new_refs = []
+            for ref in old_refs:
+                if isinstance(ref, int):
+                    if ref in old_to_new:
+                        new_refs.append({"index": old_to_new[ref], "percentage": 1})
+                elif isinstance(ref, dict):
+                    old_idx = ref.get("index")
+                    if old_idx is not None and old_idx in old_to_new:
+                        new_refs.append({**ref, "index": old_to_new[old_idx]})
             output["next_route_indexes"] = new_refs
-            # Remove camelCase variant if present
             output.pop("nextRouteIndexes", None)
 
 

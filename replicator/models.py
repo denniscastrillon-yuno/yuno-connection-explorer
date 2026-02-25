@@ -21,6 +21,7 @@ class ConnectionSpec:
     params: list[ConnectionParam]
     payment_methods: list[str]  # uppercase IDs only, e.g. ["CARD"]
     integration_code: str = ""  # account_integration_code from API
+    is_dependency: bool = False  # True if auto-added for routing completeness
 
 
 @dataclass
