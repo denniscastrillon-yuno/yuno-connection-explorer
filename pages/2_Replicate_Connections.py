@@ -22,8 +22,15 @@ from replicator.routing_fetcher import (
 
 st.set_page_config(page_title="Replicate Connections", page_icon="\U0001f504", layout="wide")
 
-# -- Sidebar: Target Config ---------------------------------------------------
+# -- Sidebar: Source & Target Config -------------------------------------------
 st.sidebar.title("Replicate Connections")
+st.sidebar.markdown("---")
+st.sidebar.subheader("Source Organization")
+source_org_code = st.sidebar.text_input(
+    "Source organization code",
+    value=ORGANIZATION_CODE,
+    key="replicate_source_org",
+)
 st.sidebar.markdown("---")
 st.sidebar.subheader("Target Organization")
 
@@ -212,7 +219,7 @@ st.markdown("Copy connections and routing rules from a source account to your ta
 
 st.subheader("Step 1: Select Source Account")
 
-raw_accounts = fetch_accounts(ORGANIZATION_CODE)
+raw_accounts = fetch_accounts(source_org_code)
 accounts = [a for a in raw_accounts if "_error" not in a]
 
 if not accounts:
