@@ -12,7 +12,7 @@ st.markdown(
 
 st.markdown("---")
 
-col1, col2 = st.columns(2)
+col1, col2, col3 = st.columns(3)
 
 with col1:
     st.subheader("Connection Explorer")
@@ -25,10 +25,18 @@ with col1:
 with col2:
     st.subheader("Replicate Connections")
     st.markdown(
-        "Copy connections and routing rules from a source account to your own organization "
-        "via automated browser interaction with the Yuno Dashboard."
+        "Copy connections and routing rules from a source account to a new target account "
+        "via direct API calls."
     )
     st.page_link("pages/2_Replicate_Connections.py", label="Open Replicator", icon="🔄")
+
+with col3:
+    st.subheader("Push Changes")
+    st.markdown(
+        "Sync connections and routing from your dev account to an existing target account. "
+        "Reviews a diff before pushing."
+    )
+    st.page_link("pages/3_Push_Changes.py", label="Open Push", icon="🚀")
 
 st.markdown("---")
 st.caption("Internal tool — Yuno Payments. Requires VPN / internal network access.")
